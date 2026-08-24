@@ -171,6 +171,104 @@ function Add-ReviewLogEntry {
     Add-Content -Path $ReviewLogPath -Value ([string]::Join("`n", $lines)) -Encoding utf8
 }
 
+# Resolved backend label for a task (model-provider.js's labelFor(), the same value the
+# Linux review-runner.sh uses at scripts/review-runner.sh:113): 'claude:<model>' when this
+# task's review vote will route to Claude, a bare local model tag otherwise. labelFor()
+# (not reasoningTierFor() alone) because AGENT_MANAGER_FORCE_PROVIDER can override a
+# task's registered tier in either direction, and only labelFor() accounts for that.
+function Resolve-TaskModelLabel {
+    param([string]$TaskPath)
+    try {
+        $lines = Invoke-WithSafeEnv { & node -e "require(process.argv[1]);const{labelFor}=require(process.argv[2]);const t=JSON.parse(require('fs').readFileSync(process.argv[3],'utf8'));console.log(labelFor(t))" (Join-Path $PackageSrcDir 'task-sources.js') (Join-Path $PackageSrcDir 'model-provider.js') $TaskPath 2>$null }
+        return ((@($lines) -join '')).Trim()
+    } catch { return '' }
+}
+
+# Claude rate-limit check for the PER-ITEM gate below (unlike the pass-wide gate above,
+# which only fires when the whole process runs ReviewProvider=claude): review/ mixes
+# drafts from both lanes, and a claude:*-labeled item's vote spends real Claude budget
+# while its local siblings don't -- so an unhealthy budget should skip just the Claude
+# items, not stall local reviews. Healthy when budget-monitor.js is absent or errors
+# (same fail-open shape agent-manager-common.sh's check_budget_healthy uses).
+function Test-ClaudeBudgetHealthy {
+    try {
+        $budgetScript = Join-Path (Split-Path -Parent $PackageSrcDir) 'budget-monitor.js'
+        if (-not (Test-Path $budgetScript)) { return $true }
+        $budgetJson = Invoke-WithSafeEnv { & node -e "try{const{isBudgetHealthy}=require(process.argv[1]);console.log(JSON.stringify(isBudgetHealthy()))}catch(e){console.log(JSON.stringify({healthy:true,reason:'budget-monitor error (treating as healthy): '+e.message}))}" $budgetScript 2>$null }
+        $budget = (@($budgetJson) -join "`n") | ConvertFrom-Json
+        return (-not $budget) -or [bool]$budget.healthy
+    } catch { return $true }
+}
+
+# Delegated review: run the SAME node src/review-task.js the Linux review-runner.sh uses
+# for a Claude-routed item, so per-task provider selection behaves identically on Windows
+# -- review-task.js runs its own deterministic gates + fact-check + 3-vote unanimous
+# majority through model-provider.js's providerFor(task), the exact backend that drafted
+# the task. It mutates the task JSON in place and prints one {succeeded, verdict} JSON
+# line; this function only files the result and does the bounded-failure bookkeeping
+# (REVIEW_FAILURE_RETRY_LIMIT parity with review-runner.sh, minus its infra-requeue
+# refinement). Model-stats outcomes are recorded inside review-task.js itself -- no
+# Invoke-ModelStatsDb here, or every verdict would be double-counted.
+function Invoke-DelegatedReview {
+    param([string]$ReviewPath, [string]$TaskId, [string]$TaskTitle)
+    $name = Split-Path -Leaf $ReviewPath
+    $reviewSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $reviewResult = $null
+    try {
+        $rawLines = Invoke-WithSafeEnv { & node (Join-Path $PackageSrcDir 'review-task.js') $ReviewPath 2>&1 }
+        # stderr is merged in (diagnostics) -- the result is the last line that parses as
+        # the JSON object review-task.js writes to stdout.
+        $jsonLine = @($rawLines | ForEach-Object { "$_" } | Where-Object { $_.Trim().StartsWith('{') }) | Select-Object -Last 1
+        if ($jsonLine) { $reviewResult = $jsonLine | ConvertFrom-Json }
+    } catch {
+        Write-Host ('review-task.js call failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
+    $reviewSw.Stop()
+    if ($reviewResult -and $reviewResult.succeeded -and $reviewResult.verdict -eq 'approved') {
+        $approvedPath = Join-Path (Join-Path $QueueDir 'approved') $name
+        New-Item -ItemType Directory -Force -Path (Split-Path $approvedPath) | Out-Null
+        Move-Item $ReviewPath $approvedPath -Force
+        Invoke-TaskDb 'approved' $approvedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reviewProvider = 'review-task.js'; factCheckResult = [string]$reviewResult.factCheckVerdict } | ConvertTo-Json -Compress)
+        Add-ReviewLogEntry -TaskId $TaskId -Title $TaskTitle -Provider 'review-task.js' -Result 'APPROVED' -Detail ('Approved by review-task.js (per-task provider routing). Fact-check: {0}' -f [string]$reviewResult.factCheckVerdict)
+        Write-Host ('Approved (delegated per-task provider): {0} -- queued for apply-runner' -f $TaskId) -ForegroundColor Cyan
+        return 'approved'
+    }
+    if ($reviewResult -and $reviewResult.succeeded -and $reviewResult.verdict -eq 'blocked') {
+        $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $name
+        New-Item -ItemType Directory -Force -Path (Split-Path $blockedPath) | Out-Null
+        Move-Item $ReviewPath $blockedPath -Force
+        Invoke-TaskDb 'blocked' $blockedPath (@{ reviewDurationMs = $reviewSw.ElapsedMilliseconds; reason = [string]$reviewResult.blockedReason } | ConvertTo-Json -Compress)
+        Add-ReviewLogEntry -TaskId $TaskId -Title $TaskTitle -Provider 'review-task.js' -Result 'REJECTED' -Detail ([string]$reviewResult.blockedReason)
+        Write-Host ('Rejected (delegated per-task provider): {0}' -f $TaskId) -ForegroundColor Yellow
+        return 'blocked'
+    }
+    # The review call itself failed -- leave the file in review/ to retry next pass,
+    # bounded at 5 attempts, then give up to blocked/ so one pathological item can't
+    # burn a real review attempt every pass forever.
+    $reasonText = if ($reviewResult -and $reviewResult.reason) { [string]$reviewResult.reason } else { 'no parseable result from review-task.js' }
+    try {
+        $t = Read-TaskJson $ReviewPath
+        $failCount = 1 + $(if ($t.PSObject.Properties['reviewFailureCount'] -and $t.reviewFailureCount) { [int]$t.reviewFailureCount } else { 0 })
+        $t | Add-Member -NotePropertyName 'reviewFailureCount' -NotePropertyValue $failCount -Force
+        if ($failCount -ge 5) {
+            $reason = 'review call failed {0} times in a row (most recent: {1}) -- giving up rather than retrying every pass forever.' -f $failCount, $reasonText
+            Set-TaskBlockedStage -Task $t -Reason $reason -Stage 'review-call-failed'
+            $blockedPath = Join-Path (Join-Path $QueueDir 'blocked') $name
+            New-Item -ItemType Directory -Force -Path (Split-Path $blockedPath) | Out-Null
+            Write-TaskJson $blockedPath $t
+            Remove-Item $ReviewPath -Force
+            Invoke-TaskDb 'blocked' $blockedPath (@{ reason = $reason } | ConvertTo-Json -Compress)
+            Write-Host ('Giving up on {0} after {1} failed delegated review attempts -- moved to blocked/.' -f $TaskId, $failCount) -ForegroundColor Red
+        } else {
+            Write-TaskJson $ReviewPath $t
+            Write-Host ('Delegated review failed for {0} (attempt {1}/5): {2} -- staying in review/ for a later pass.' -f $TaskId, $failCount, $reasonText) -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host ('Delegated review failed for {0} and its file could not be updated: {1}' -f $TaskId, $_.Exception.Message) -ForegroundColor Red
+    }
+    return 'error'
+}
+
 # One review pass. Returns 'budget' | 'idle' | 'done' | 'blocked' | 'approved' so the main
 # loop can pick the right sleep.
 function Invoke-ReviewPass {
@@ -190,16 +288,51 @@ function Invoke-ReviewPass {
     }
 
     $reviewDir = Join-Path $QueueDir 'review'
-    $next = Get-ChildItem $reviewDir -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object CreationTime | Select-Object -First 1
+    $candidates = @(Get-ChildItem $reviewDir -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object CreationTime)
 
-    if (-not $next) {
+    if (-not $candidates) {
         Write-Host 'Nothing in review/. Nothing to do.' -ForegroundColor DarkGray
         return 'idle'
+    }
+
+    # Pick the oldest item, but skip (don't consume) Claude-routed items while Claude's
+    # budget is unhealthy -- they stay in review/ for a later pass while local items keep
+    # reviewing normally (per-item gate, parity with review-runner.sh's own; see
+    # Test-ClaudeBudgetHealthy above). Budget checked once per pass, and only if a
+    # claude:* item is actually up next.
+    $next = $null
+    $nextLabel = ''
+    $claudeBudgetOk = $null
+    $sawBudgetSkip = $false
+    foreach ($cand in $candidates) {
+        $label = Resolve-TaskModelLabel -TaskPath $cand.FullName
+        if ($label -like 'claude:*') {
+            if ($null -eq $claudeBudgetOk) { $claudeBudgetOk = Test-ClaudeBudgetHealthy }
+            if (-not $claudeBudgetOk) { $sawBudgetSkip = $true; continue }
+        }
+        $next = $cand
+        $nextLabel = $label
+        break
+    }
+    if (-not $next) {
+        Write-Host 'Only Claude-routed items in review/ and Claude budget is unhealthy -- backing off.' -ForegroundColor DarkYellow
+        return $(if ($sawBudgetSkip) { 'budget' } else { 'idle' })
     }
 
     $task = Read-TaskJson $next.FullName
     Write-Host ('Reviewing: {0}' -f $task.title) -ForegroundColor Green
     Write-Heartbeat -Status 'working' -TaskId $task.id
+
+    # Per-task provider routing (parity with scripts/review-runner.sh + review-task.js): a
+    # claude:*-labeled item -- a high-tier draft, or one forced onto Claude by the
+    # dashboard override -- delegates its ENTIRE review to node review-task.js, whose
+    # majority vote routes through the same providerFor(task) that drafted it. Everything
+    # else keeps this script's native passes below (which retain the arch structural
+    # checks review-task.js omits). REVIEW_PROVIDER=claude still forces the process-wide
+    # Claude review+apply path for every task, unchanged.
+    if ($ReviewProvider -ne 'claude' -and $nextLabel -like 'claude:*') {
+        return Invoke-DelegatedReview -ReviewPath $next.FullName -TaskId $task.id -TaskTitle $task.title
+    }
 
     # Validate the domain FIRST, before any fact-check/prompt work, and BEFORE the
     # provider dispatch below -- Get-WorkDir/Get-DomainConfig both throw on an unknown
