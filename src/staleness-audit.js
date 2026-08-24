@@ -173,7 +173,10 @@ function findFilesTouchedSince(repoRoot, task) {
   for (const claimed of claimedPaths) {
     const resolved = resolveAgainstRepo(repoRoot, claimed);
     if (!resolved) continue; // not a real file in this repo -- nothing to check against
-    const relPath = path.relative(repoRoot, resolved);
+    // Forward slashes always: git pathspecs accept them on every platform, while the
+    // backslashes path.relative() produces on Windows would leak into the reported
+    // touched-files evidence (and any comparison against git's own /-separated output).
+    const relPath = path.relative(repoRoot, resolved).split(path.sep).join('/');
     try {
       const out = execFileSync(
         'git', ['log', `--since=${createdAtIso}`, '--oneline', '-1', '--', relPath],

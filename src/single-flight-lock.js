@@ -32,16 +32,83 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const LOCK_CHILD_FD = 3; // arbitrary -- just needs to not collide with the child's own 0/1/2
+const IS_WINDOWS = process.platform === 'win32';
+const WINDOWS_POLL_MS = 200;
+// A lockfile with unreadable/absent PID content only counts as stale once it's had ample
+// time to finish being written -- guards against reaping a contender mid-create.
+const WINDOWS_UNREADABLE_STALE_MS = 10_000;
 
 function lockFilePath(instancesDir) {
   return path.join(instancesDir, '.pipeline-single-flight.lock');
 }
 
+// Synchronous sleep -- acquire() is deliberately blocking/synchronous on both platforms
+// (see the POSIX path's comment); this is the only dependency-free way to wait without
+// busy-spinning the CPU.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but belongs to someone else -- still alive.
+    return err.code === 'EPERM';
+  }
+}
+
+// Windows has no flock(1)/flock(2) equivalent reachable from Node, so the lock there is
+// the classic create-exclusive lockfile: whoever wins the atomic O_EXCL create owns the
+// lock; release deletes the file. The PID written inside is the crash-recovery story
+// flock gets for free from the kernel -- a worker SIGKILL'd mid-draft (a failure mode
+// this pipeline hits routinely, see dead-process-check.js) leaves the file behind, and
+// the next waiter reaps it once that PID is verifiably dead. The mtime/ino re-check
+// before unlink keeps two waiters from reaping each other's freshly-created lock.
+// Interop note: on Windows there is no bash contender to interoperate with -- the .ps1
+// daemons predate this lock and every post-migration lane that takes it does so through
+// this module, so same-mechanism mutual exclusion is the whole requirement.
+function acquireWindows(instancesDir) {
+  const lockPath = lockFilePath(instancesDir);
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      return { fd, lockPath };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+    let stat;
+    let pid;
+    try {
+      stat = fs.statSync(lockPath);
+      pid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    } catch {
+      continue; // holder released between our open and this read -- retry immediately
+    }
+    const stale = Number.isFinite(pid)
+      ? !pidAlive(pid)
+      : Date.now() - stat.mtimeMs > WINDOWS_UNREADABLE_STALE_MS;
+    if (stale) {
+      try {
+        const recheck = fs.statSync(lockPath);
+        if (recheck.mtimeMs === stat.mtimeMs && recheck.ino === stat.ino) fs.unlinkSync(lockPath);
+      } catch {
+        // someone else reaped or replaced it first -- fine, retry
+      }
+      continue;
+    }
+    sleepSync(WINDOWS_POLL_MS);
+  }
+}
+
 // Blocking, exclusive acquire -- no timeout, no -n, matching the bash version exactly
 // (a caller that wants a bounded wait should wrap this in its own timeout, this function
-// itself will wait as long as it takes, same as flock's own default). Returns a real fd;
-// pass it to release().
+// itself will wait as long as it takes, same as flock's own default). Returns an opaque
+// handle (a real fd on POSIX, an object on Windows); pass it to release().
 function acquire(instancesDir) {
+  if (IS_WINDOWS) return acquireWindows(instancesDir);
   const fd = fs.openSync(lockFilePath(instancesDir), 'w');
   try {
     execFileSync('flock', [String(LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });
@@ -54,12 +121,18 @@ function acquire(instancesDir) {
 
 // Releases a lock acquired above. Safe to call more than once or with an already-closed
 // fd (best-effort, matching release_single_flight_lock()'s own `|| true`).
-function release(fd) {
-  if (fd == null) return;
+function release(handle) {
+  if (handle == null) return;
+  const fd = typeof handle === 'object' ? handle.fd : handle;
   try {
     fs.closeSync(fd);
   } catch {
     // already closed -- nothing to do.
+  }
+  // On Windows the file's existence IS the lock, so releasing must delete it (on POSIX
+  // the file deliberately stays -- flock ownership lives on the open file description).
+  if (typeof handle === 'object' && handle.lockPath) {
+    try { fs.unlinkSync(handle.lockPath); } catch { /* already reaped -- nothing to do */ }
   }
 }
 

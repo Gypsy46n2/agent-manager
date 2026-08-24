@@ -5,11 +5,43 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const { acquire, release, withLock, lockFilePath } = require('./single-flight-lock.js');
+
+const IS_WINDOWS = process.platform === 'win32';
 
 function makeInstancesDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'single-flight-lock-test-'));
+}
+
+// Platform-appropriate "is the lock currently free?" probe. POSIX asks a real bash
+// flock -n (the exact contender the production bash lanes use); Windows attempts the
+// same atomic create-exclusive the module itself uses (undone immediately if it wins).
+function probeFree(dir) {
+  if (IS_WINDOWS) {
+    try {
+      const fd = fs.openSync(lockFilePath(dir), 'wx');
+      fs.closeSync(fd);
+      fs.unlinkSync(lockFilePath(dir));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir)}"; timeout 1 flock -n 200 && echo FREE || echo HELD`]);
+  return /FREE/.test(result.stdout.toString());
+}
+
+// A real second-process contender built from this module itself -- works identically on
+// both platforms, unlike the bash flock contender below (POSIX-only, cross-mechanism).
+function spawnNodeContender(dir) {
+  const script = `
+    const { acquire, release } = require(${JSON.stringify(path.join(__dirname, 'single-flight-lock.js'))});
+    const fd = acquire(${JSON.stringify(dir)});
+    console.log('ACQUIRED');
+    release(fd);
+  `;
+  return spawn(process.execPath, ['-e', script]);
 }
 
 test('lockFilePath matches the exact bash lockfile name (interop depends on this)', () => {
@@ -17,15 +49,14 @@ test('lockFilePath matches the exact bash lockfile name (interop depends on this
   assert.equal(lockFilePath(dir), path.join(dir, '.pipeline-single-flight.lock'));
 });
 
-test('acquire then release: a second acquire() in the SAME process succeeds only after release()', () => {
+test('acquire then release: a second acquire() from another process succeeds only after release()', () => {
   const dir = makeInstancesDir();
   const fd1 = acquire(dir);
 
-  // A second acquire from a background child (bash flock, matching how a real other lane
-  // would contend) must block until fd1 is released -- verified by timing, not just
-  // "eventually returns".
+  // A second acquire from a background child process must block until fd1 is released --
+  // verified by timing, not just "eventually returns".
   const start = Date.now();
-  const child = require('child_process').spawn('bash', ['-c', `exec 200>"${lockFilePath(dir)}"; flock 200; echo ACQUIRED`]);
+  const child = spawnNodeContender(dir);
   let out = '';
   child.stdout.on('data', (d) => { out += d; });
 
@@ -41,7 +72,7 @@ test('acquire then release: a second acquire() in the SAME process succeeds only
   });
 });
 
-test('a real bash flock process blocks on a Node-held lock and acquires the instant Node releases (cross-mechanism interop)', () => {
+test('a real bash flock process blocks on a Node-held lock and acquires the instant Node releases (cross-mechanism interop)', { skip: IS_WINDOWS && 'bash flock interop is POSIX-only; Windows has no bash lane to interoperate with' }, () => {
   const dir = makeInstancesDir();
   const fd = acquire(dir);
 
@@ -54,6 +85,17 @@ test('a real bash flock process blocks on a Node-held lock and acquires the inst
   assert.match(result2.stdout.toString(), /GOT_IT/, 'a non-blocking flock attempt must succeed once Node has released');
 });
 
+test('a stale lockfile left by a dead holder is reaped instead of deadlocking (Windows crash-recovery)', { skip: !IS_WINDOWS && 'POSIX flock ownership dies with the process; only the Windows lockfile scheme needs reaping' }, () => {
+  const dir = makeInstancesDir();
+  // Simulate a SIGKILL'd holder: a lockfile whose recorded PID no longer runs. PID 1 is
+  // never a live user process on Windows (the idle "process" is 0, System is 4).
+  fs.writeFileSync(lockFilePath(dir), '1');
+  const handle = acquire(dir);
+  assert.ok(handle, 'acquire must reap the dead holder\'s lockfile and take the lock');
+  release(handle);
+  assert.ok(probeFree(dir), 'lock must be free again after release');
+});
+
 test('withLock releases even when the wrapped function throws', async () => {
   const dir = makeInstancesDir();
   await assert.rejects(
@@ -61,9 +103,7 @@ test('withLock releases even when the wrapped function throws', async () => {
     /boom/,
   );
 
-  // Lock must be free afterward -- a real bash flock -n attempt should succeed immediately.
-  const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir)}"; timeout 1 flock -n 200 && echo FREE || echo STILL_HELD`]);
-  assert.match(result.stdout.toString(), /FREE/, 'withLock must release the lock even after the wrapped function throws');
+  assert.ok(probeFree(dir), 'withLock must release the lock even after the wrapped function throws');
 });
 
 test('withLock releases after a successful async function and returns its value', async () => {
@@ -74,8 +114,7 @@ test('withLock releases after a successful async function and returns its value'
   });
   assert.equal(value, 'real-result');
 
-  const result = spawnSync('bash', ['-c', `exec 200>"${lockFilePath(dir)}"; timeout 1 flock -n 200 && echo FREE || echo STILL_HELD`]);
-  assert.match(result.stdout.toString(), /FREE/);
+  assert.ok(probeFree(dir));
 });
 
 test('release is safe to call twice (matches release_single_flight_lock()\'s own best-effort semantics)', () => {

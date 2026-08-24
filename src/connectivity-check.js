@@ -25,7 +25,7 @@ function probeOnce() {
   try {
     const out = execFileSync(
       'curl',
-      ['-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', String(TIMEOUT_SECONDS), CHECK_URL],
+      ['-s', '-o', process.platform === 'win32' ? 'NUL' : '/dev/null', '-w', '%{http_code}', '--max-time', String(TIMEOUT_SECONDS), CHECK_URL],
       { encoding: 'utf8', timeout: (TIMEOUT_SECONDS + 2) * 1000 },
     );
     const status = parseInt(out.trim(), 10);

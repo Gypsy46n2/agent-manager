@@ -13,8 +13,14 @@
   "engines": {
     "node": ">=22.5.0"
   },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  },
   "scripts": {
     "test": "node --test src/*.test.js src/**/*.test.js *.test.js",
     "drift-scan": "node src/drift-scan.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
   }
 }

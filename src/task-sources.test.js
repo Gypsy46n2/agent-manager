@@ -531,8 +531,10 @@ test('nextBrainDumpSortTask offers the next-oldest captured entry when the oldes
 // prompt only ever said "a self-referential note is real, not a placeholder," never
 // connected that to "and therefore belongs to the project it describes." selfProjectLabel
 // is __dirname-derived (this file's own location, NOT mockable via env), so these tests
-// use the real resulting value ("agent-manager", since src/task-sources.js always lives
-// under a directory named that) rather than a fake candidate.
+// compute the real resulting value (this checkout's own directory name -- "agent-manager"
+// upstream, but forks/clones under any other name are equally valid) rather than
+// hardcoding a fake candidate.
+const SELF_PROJECT_LABEL = path.basename(path.join(__dirname, '..'));
 function writeProjectsRegistryFixture(dir, labels) {
   const registryPath = path.join(dir, 'projects.json');
   fs.writeFileSync(registryPath, JSON.stringify(labels.map((label) => ({ label, repoRoot: '/x', pipelineDir: '/x', domainsPath: '/x' }))));
@@ -541,13 +543,13 @@ function writeProjectsRegistryFixture(dir, labels) {
 
 test('nextBrainDumpSortTask sets selfProjectLabel when this package\'s own directory name is a tracked project', () => {
   const dir = makeBrainDumpFixtureRepo();
-  writeProjectsRegistryFixture(dir, ['agent-manager', 'some-other-project']);
+  writeProjectsRegistryFixture(dir, [SELF_PROJECT_LABEL, 'some-other-project']);
   fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
     entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
   }));
   const { nextBrainDumpSortTask } = freshTaskSources(dir);
   const task = nextBrainDumpSortTask();
-  assert.equal(task.promptContext.selfProjectLabel, 'agent-manager');
+  assert.equal(task.promptContext.selfProjectLabel, SELF_PROJECT_LABEL);
 });
 
 test('nextBrainDumpSortTask leaves selfProjectLabel null when this package is not itself a tracked project', () => {

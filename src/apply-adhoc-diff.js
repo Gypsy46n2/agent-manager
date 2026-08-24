@@ -61,7 +61,11 @@ function applyAdhocDiff({ task, repoRoot }) {
     // needed for a diff captured this way (not hand-written, so a header/body mismatch is
     // a capture-format quirk, not a sign of real corruption -- --numstat above already
     // proved the patch parses and lists real files before this point).
-    execFileSync('git', ['apply', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    // -c core.autocrlf=false: the diff is applied byte-exact on every platform. Without
+    // it, a Windows git with the (default) global autocrlf=true rewrites every applied
+    // line to CRLF on disk -- bytes the model never produced, and a working tree that
+    // no longer matches the reviewed diff.
+    execFileSync('git', ['-c', 'core.autocrlf=false', 'apply', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
 
     return { files };
   } catch (e) {
