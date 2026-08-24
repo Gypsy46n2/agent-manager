@@ -4508,6 +4508,10 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     creationflags = subprocess.CREATE_NEW_CONSOLE
     scripts = [
         (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "ornith-worker.ps1"), "-InstanceId", "worker-1"], "Ornith Worker 1"),
+        # worker-reasoning: the high-reasoning-tier lane (adhoc/research/etc) -- routes to
+        # Claude by default, or a local model via the Workers tab override. Without it,
+        # high-tier tasks are never claimed by anyone on Windows.
+        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "ornith-worker.ps1"), "-InstanceId", "worker-reasoning"], "Ornith Worker Reasoning"),
         (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Ornith Review Runner"),
         (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
     ]

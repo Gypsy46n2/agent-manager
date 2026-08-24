@@ -49,6 +49,18 @@ if (-not (Test-InstanceLiveness -InstanceId $InstanceId -TickSecs 60)) { exit 1 
 $env:LOCAL_MODEL = $Model
 $env:ORNITH_MODEL = $Model
 
+# Parallel reasoning lane (port of local-worker.sh's IS_CLAUDE_LANE, Brain Dump #77):
+# any instance named worker-reasoning* claims ONLY tasks whose reasoning tier
+# (model-provider.js's reasoningTierFor()) resolves to 'high' -- routed to Claude by
+# default, or to a local model when the dashboard override forces one -- and every other
+# worker-* instance skips those, leaving them for this lane. Pure naming convention;
+# queue-watchdog.ps1's RESTART_MAP already matches any 'worker-*' generically, so a
+# reasoning instance is auto-restart-eligible for free.
+$IsClaudeLane = $InstanceId -like 'worker-reasoning*'
+# So local-client.js/model-inflight-lock.js can stamp in-flight lock records with the
+# holder's identity -- purely diagnostic (same export local-worker.sh does at startup).
+$env:AGENT_MANAGER_INSTANCE_ID = $InstanceId
+
 # Same-stage A/B candidates for the implement pass only (see Select-AbModel below). Unset
 # or single-entry -- the default -- means every implement call uses $Model, byte-identical
 # to before this existed. Only safe on a single worker instance, same reason as above:
@@ -64,10 +76,111 @@ New-Item -ItemType Directory -Force -Path $MyDraftingDir | Out-Null
 
 # Captured once at startup so the dashboard can show instance uptime.
 $startedAt = (Get-Date).ToString('o')
+$script:HeartbeatModel = $Model
 
 function Write-Heartbeat {
     param([string]$Status, [string]$TaskId = $null, [string]$Pass = $null)
-    Write-HeartbeatFile -InstanceId $InstanceId -Status $Status -Model $Model -TaskId $TaskId -Pass $Pass -StartedAt $startedAt
+    Write-HeartbeatFile -InstanceId $InstanceId -Status $Status -Model $script:HeartbeatModel -TaskId $TaskId -Pass $Pass -StartedAt $startedAt
+}
+
+# Per-tick model refresh (port of local-worker.sh's refresh_active_model): picks up the
+# dashboard Workers tab's per-instance model override from dashboard-settings.json, so a
+# dropdown change takes effect on the very next tick with no restart. The reasoning
+# lane's override can name EITHER backend -- 'claude:<model>' or 'ollama:<model>'
+# (2026-08-18, Grimmethy: "I need to be able to select from both subscription and local
+# models"); AGENT_MANAGER_FORCE_PROVIDER is model-provider.js's own hook for that, and
+# adhoc/research's agentic Claude implement calls are unaffected either way (see
+# model-provider.js's header). The plain local lane's override stays a bare model name.
+function Update-ActiveModel {
+    $override = $null
+    try {
+        $settingsPath = Join-Path (Split-Path -Parent $PackageSrcDir) 'dashboard-settings.json'
+        if (Test-Path $settingsPath) {
+            $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
+            $overrides = $settings.workerModelOverrides
+            if ($overrides -and $overrides.PSObject.Properties[$InstanceId]) { $override = [string]$overrides.$InstanceId }
+        }
+    } catch { }
+    if ($IsClaudeLane) {
+        if ($override -like 'ollama:*') {
+            $env:LOCAL_MODEL = $override.Substring(7)
+            $env:ORNITH_MODEL = $env:LOCAL_MODEL
+            $env:AGENT_MANAGER_FORCE_PROVIDER = 'local'
+            $script:HeartbeatModel = $env:LOCAL_MODEL
+        } elseif ($override -like 'claude:*') {
+            $env:CLAUDE_MODEL = $override.Substring(7)
+            $env:AGENT_MANAGER_FORCE_PROVIDER = 'claude'
+            $script:HeartbeatModel = $override
+        } else {
+            Remove-Item env:AGENT_MANAGER_FORCE_PROVIDER -ErrorAction SilentlyContinue
+            $script:HeartbeatModel = 'claude:{0}' -f $(if ($env:CLAUDE_MODEL) { $env:CLAUDE_MODEL } else { 'sonnet' })
+        }
+    } else {
+        Remove-Item env:AGENT_MANAGER_FORCE_PROVIDER -ErrorAction SilentlyContinue
+        if ($override) {
+            $env:LOCAL_MODEL = $override
+            $env:ORNITH_MODEL = $override
+        }
+        $script:HeartbeatModel = $env:LOCAL_MODEL
+    }
+}
+Update-ActiveModel
+
+# Delegated draft: run the SAME node src/local-draft.js the Linux worker uses for a
+# high-reasoning-tier task, so backend selection (Claude vs local, per task, plus the
+# dashboard override via AGENT_MANAGER_FORCE_PROVIDER) behaves identically on Windows --
+# including adhoc/research's real agentic Claude Code CLI drafting with tool access,
+# which this script's inline passes cannot provide. local-draft.js mutates the task JSON
+# in place and prints one {succeeded, blocked, ...} JSON line; this function only files
+# the result (review/ or blocked/) and does the bounded-failure bookkeeping, mirroring
+# local-worker.sh's process_drafting_file.
+function Invoke-DelegatedDraft {
+    param([string]$DraftingPath, [string]$TaskId)
+    $name = Split-Path -Leaf $DraftingPath
+    Write-Heartbeat -Status 'working' -TaskId $TaskId -Pass 'draft'
+    $draftResult = $null
+    try {
+        $rawLines = Invoke-WithSafeEnv { & node (Join-Path $PackageSrcDir 'local-draft.js') $DraftingPath 2>&1 }
+        # stderr is merged in (diagnostics), so pick the result line out: the last line
+        # that parses as the JSON object local-draft.js writes to stdout.
+        $jsonLine = @($rawLines | ForEach-Object { "$_" } | Where-Object { $_.Trim().StartsWith('{') }) | Select-Object -Last 1
+        if ($jsonLine) { $draftResult = $jsonLine | ConvertFrom-Json }
+    } catch {
+        Write-Host ('local-draft.js call failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
+    if ($draftResult -and $draftResult.succeeded) {
+        $destDir = if ($draftResult.blocked) { 'blocked' } else { 'review' }
+        New-Item -ItemType Directory -Force -Path (Join-Path $QueueDir $destDir) | Out-Null
+        Move-Item $DraftingPath (Join-Path (Join-Path $QueueDir $destDir) $name) -Force
+        if ($draftResult.blocked) {
+            Write-Host ('Delegated draft blocked {0}: {1}' -f $TaskId, $draftResult.blockedReason) -ForegroundColor Yellow
+        } else {
+            Write-Host ('Delegated draft ready for review: {0}' -f $TaskId) -ForegroundColor Green
+        }
+    } else {
+        # The draft call itself failed (Claude CLI missing/rate-limited, Ollama down, a
+        # thrown error) -- retried via the per-tick resume pass, bounded at 5 attempts
+        # (local-worker.sh's DRAFT_FAILURE_RETRY_LIMIT), then given up to blocked/ so one
+        # persistently failing task can't starve this lane forever.
+        $reasonText = if ($draftResult -and $draftResult.reason) { [string]$draftResult.reason } else { 'no parseable result from local-draft.js' }
+        try {
+            $t = Read-TaskJson $DraftingPath
+            $failCount = 1 + $(if ($t.PSObject.Properties['draftFailureCount'] -and $t.draftFailureCount) { [int]$t.draftFailureCount } else { 0 })
+            $t | Add-Member -NotePropertyName 'draftFailureCount' -NotePropertyValue $failCount -Force
+            if ($failCount -ge 5) {
+                Set-TaskBlockedStage -Task $t -Reason ('draft call failed {0} times in a row (most recent: {1}) -- giving up rather than retrying every tick forever and starving this lane.' -f $failCount, $reasonText) -Stage 'draft'
+                New-Item -ItemType Directory -Force -Path (Join-Path $QueueDir 'blocked') | Out-Null
+                Write-TaskJson (Join-Path (Join-Path $QueueDir 'blocked') $name) $t
+                Remove-Item $DraftingPath -Force
+                Write-Host ('Giving up on {0} after {1} failed delegated draft attempts -- moved to blocked/.' -f $TaskId, $failCount) -ForegroundColor Red
+            } else {
+                Write-TaskJson $DraftingPath $t
+                Write-Host ('Delegated draft failed for {0} (attempt {1}/5): {2} -- retrying via the per-tick resume pass.' -f $TaskId, $failCount, $reasonText) -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host ('Delegated draft failed for {0} and its file could not be updated: {1}' -f $TaskId, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
 }
 
 function Invoke-OrnithClient {
@@ -245,6 +358,33 @@ if (-not (Test-Path $LiveLogPath)) {
 Write-Heartbeat -Status 'idle'
 
 while ($true) {
+    # Pick up a dashboard model-override change (or its removal) before this tick does
+    # any real work -- see Update-ActiveModel's own comment above.
+    Update-ActiveModel
+
+    # Claude rate-limit gate (port of local-worker.sh's check_budget_healthy call): only
+    # the reasoning lane needs this -- it's the only lane whose tasks route to Claude. A
+    # local-model worker checking it too would wrongly stall local work every time
+    # Claude's account-wide cap is hit. Skips straight to a 10-minute backoff (matching
+    # review-runner.ps1/apply-runner.ps1's own 'budget' tier) rather than hammering a
+    # known rate-limit window every tick.
+    if ($IsClaudeLane) {
+        $budget = $null
+        try {
+            $budgetScript = Join-Path (Split-Path -Parent $PackageSrcDir) 'budget-monitor.js'
+            if (Test-Path $budgetScript) {
+                $budgetJson = Invoke-WithSafeEnv { & node -e "try{const{isBudgetHealthy}=require(process.argv[1]);console.log(JSON.stringify(isBudgetHealthy()))}catch(e){console.log(JSON.stringify({healthy:true,reason:'budget-monitor error (treating as healthy): '+e.message}))}" $budgetScript 2>$null }
+                $budget = (@($budgetJson) -join "`n") | ConvertFrom-Json
+            }
+        } catch { }
+        if ($budget -and -not $budget.healthy) {
+            Write-Host ('Claude budget not healthy: {0} -- sleeping 10 minutes.' -f $budget.reason) -ForegroundColor DarkYellow
+            Write-Heartbeat -Status 'idle'
+            Start-Sleep -Seconds 600
+            continue
+        }
+    }
+
     # Per-tick crash-resume (parity with local-worker.sh's top-of-tick pass -- see
     # docs/linux-migration-2026-08-14.md item 8): a draft interrupted mid-call sits in
     # THIS instance's own drafting/ subfolder, where the startup-only orphan scan above
@@ -257,7 +397,11 @@ while ($true) {
         $next = $resumeFile
         $draftingPath = $resumeFile.FullName
     } else {
-    node (Join-Path $PackageSrcDir 'task-sources.js') | Write-Host
+    # --tier scopes generation to this lane's own reasoning tier (see local-worker.sh's
+    # own comment on why both lanes generate, each for its own tier): without it, one
+    # lane's generation call can keep surfacing the OTHER tier's backlog candidate every
+    # tick, never reaching its own tier's real work.
+    node (Join-Path $PackageSrcDir 'task-sources.js') "--tier=$(if ($IsClaudeLane) { 'high' } else { 'low' })" | Write-Host
 
     # DB mirror: make sure every pending file has a row (idempotent upsert per file).
     $pendingDir = Join-Path $QueueDir 'pending'
@@ -292,12 +436,30 @@ while ($true) {
     $readinessMap = $null
     try { $readinessMap = $readinessMapJson | ConvertFrom-Json } catch { }
 
+    # Reasoning-tier lane split (see $IsClaudeLane above): {taskId: 'low'|'high'} for
+    # everything in pending/, from the SAME reasoningTierFor() local-draft.js routes
+    # backends with, so claim-lane and backend decisions can never disagree. One batch
+    # node call per tick, same split as --priority-map/--pending-readiness. A task absent
+    # from the map counts as 'low' (fail-open to the ordinary local lane).
+    $tiersMapJson = node (Join-Path $PackageSrcDir 'task-sources.js') --pending-tiers 2>$null
+    $tiersMap = $null
+    try { $tiersMap = $tiersMapJson | ConvertFrom-Json } catch { }
+
     $next = Get-ChildItem $pendingDir -Filter '*.json' -ErrorAction SilentlyContinue |
         ForEach-Object {
             $rank = 999
             $ready = $true
             $taskId = $_.BaseName
             if ($readinessMap -and $readinessMap.PSObject.Properties[$taskId] -and $readinessMap.$taskId -eq $false) {
+                $ready = $false
+            }
+            # Lane filter: the reasoning lane claims ONLY high-tier tasks; every other
+            # lane skips them, leaving them free for the reasoning lane to pick up.
+            $tier = 'low'
+            if ($tiersMap -and $tiersMap.PSObject.Properties[$taskId]) { $tier = [string]$tiersMap.$taskId }
+            if ($IsClaudeLane) {
+                if ($tier -ne 'high') { $ready = $false }
+            } elseif ($tier -eq 'high') {
                 $ready = $false
             }
             try {
@@ -391,7 +553,24 @@ while ($true) {
     }
 
     Write-Host ('Drafting: {0}' -f $task.title) -ForegroundColor Green
-    Invoke-TaskDb 'claimed' $draftingPath (@{ instanceId = $InstanceId; model = $Model } | ConvertTo-Json -Compress)
+    Invoke-TaskDb 'claimed' $draftingPath (@{ instanceId = $InstanceId; model = $script:HeartbeatModel } | ConvertTo-Json -Compress)
+
+    # Reasoning-tier dispatch: a high-tier task (and everything the reasoning lane holds,
+    # including a resumed leftover) drafts through node local-draft.js -- the same module
+    # the Linux worker uses -- which routes each pass to Claude or the local model via
+    # model-provider.js's providerFor(). Low-tier tasks keep this script's native inline
+    # passes below, which retain the arch_discovery/arch_import structural checks
+    # local-draft.js deliberately omits.
+    $resolvedTier = 'low'
+    try {
+        $tierLines = Invoke-WithSafeEnv { & node -e "require(process.argv[1]);const{reasoningTierFor}=require(process.argv[2]);const t=JSON.parse(require('fs').readFileSync(process.argv[3],'utf8'));console.log(reasoningTierFor(t))" (Join-Path $PackageSrcDir 'task-sources.js') (Join-Path $PackageSrcDir 'model-provider.js') $draftingPath 2>$null }
+        if (((@($tierLines) -join '')).Trim() -eq 'high') { $resolvedTier = 'high' }
+    } catch { }
+    if ($IsClaudeLane -or $resolvedTier -eq 'high') {
+        Invoke-DelegatedDraft -DraftingPath $draftingPath -TaskId $task.id
+        Write-Heartbeat -Status 'idle'
+        continue
+    }
 
     # Pre-drafted task escape hatch: when the caller (a human, or an orchestrating agent
     # acting as architect) already knows the exact implementResponse and sets

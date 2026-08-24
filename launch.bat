@@ -29,6 +29,10 @@ if defined AGENT_MANAGER_REPO_ROOT (
         rem a real script bug), the window stays open showing the actual PowerShell error
         rem instead of flash-closing the instant it happens.
         start "Ornith Worker 1" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\ornith-worker.ps1" -InstanceId worker-1
+        rem worker-reasoning: the high-reasoning-tier lane (adhoc/research/etc) -- routes
+        rem to Claude by default, or a local model via the dashboard's Workers tab
+        rem override. Without it, high-tier tasks are never claimed by anyone.
+        start "Ornith Worker Reasoning" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\ornith-worker.ps1" -InstanceId worker-reasoning
         start "Ornith Review Runner" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\review-runner.ps1"
         start "Apply Runner" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\apply-runner.ps1"
         start "Queue Watchdog" powershell.exe -NoExit -ExecutionPolicy Bypass -File "%PACKAGE_SRC%\queue-watchdog.ps1"

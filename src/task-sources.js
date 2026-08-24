@@ -2045,6 +2045,29 @@ if (require.main === module) {
     return;
   }
 
+  // `node task-sources.js --pending-tiers` prints {taskId: 'low'|'high'} for every task
+  // currently sitting in pending/ -- consumed by ornith-worker.ps1's claim loop so the
+  // worker-reasoning lane split uses the SAME reasoningTierFor() local-draft.js/
+  // review-task.js route backends with (one batch call per tick instead of one node
+  // process per pending file). Same split as --pending-readiness above; a malformed file
+  // is simply absent from the map, and absent means "low" to the consumer (fail-open to
+  // the ordinary local lane, matching reasoningTierFor()'s own default).
+  if (process.argv.includes('--pending-tiers')) {
+    const { pipelineDir } = getConfig();
+    const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+    const map = {};
+    let files = [];
+    try { files = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json')); } catch { /* no pending dir yet */ }
+    for (const f of files) {
+      try {
+        const task = JSON.parse(fs.readFileSync(path.join(pendingDir, f), 'utf8'));
+        map[f.slice(0, -'.json'.length)] = reasoningTierFor(task);
+      } catch { /* malformed -- absent from the map */ }
+    }
+    console.log(JSON.stringify(map));
+    return;
+  }
+
   // `node task-sources.js --approval-modes` prints {name: mode} for every registered
   // source -- the resolved three-tier approval mode (config.js's approvalModeOverrides,
   // falling back to defaultApprovalMode), consumed by apply-runner.ps1 so its automatic
