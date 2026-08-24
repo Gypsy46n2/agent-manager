@@ -1,6 +1,6 @@
 param(
     [string]$InstanceId = ('worker-{0}' -f $PID),
-    [string]$Model = $(if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' })
+    [string]$Model = $(if ($env:LOCAL_MODEL) { $env:LOCAL_MODEL } elseif ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' })
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'load-env.ps1')
@@ -44,6 +44,9 @@ if (-not (Test-InstanceLiveness -InstanceId $InstanceId -TickSecs 60)) { exit 1 
 # All concurrent instances should normally use the SAME model tier -- Ollama keeps only
 # one tier resident on typical hardware (OLLAMA_MAX_LOADED_MODELS effectively 1), so
 # mixing model tiers across instances causes swap-load thrashing, not parallelism.
+# LOCAL_MODEL is what local-client.js (the 2026-08-22 rename of ornith-client.js) reads;
+# ORNITH_MODEL kept set too for anything legacy still watching the old name.
+$env:LOCAL_MODEL = $Model
 $env:ORNITH_MODEL = $Model
 
 # Same-stage A/B candidates for the implement pass only (see Select-AbModel below). Unset
@@ -51,7 +54,8 @@ $env:ORNITH_MODEL = $Model
 # to before this existed. Only safe on a single worker instance, same reason as above:
 # running distinct candidate lists across concurrent instances would thrash the model
 # cache the same way mixed model tiers would.
-$AbCandidates = if ($env:ORNITH_AB_MODELS) { $env:ORNITH_AB_MODELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } } else { @() }
+$AbModelsRaw = if ($env:LOCAL_AB_MODELS) { $env:LOCAL_AB_MODELS } else { $env:ORNITH_AB_MODELS }
+$AbCandidates = if ($AbModelsRaw) { $AbModelsRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } } else { @() }
 
 # Per-instance drafting subfolder: the claim mechanism. Move-Item into it is atomic on
 # the same volume, so two workers can never hold the same task file.
@@ -73,7 +77,7 @@ function Invoke-OrnithClient {
     if ($Format) { $reqObj | Add-Member -NotePropertyName 'format' -NotePropertyValue $Format }
     if ($ModelOverride) { $reqObj | Add-Member -NotePropertyName 'model' -NotePropertyValue $ModelOverride }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-client.js'
     # 2>&1 is load-bearing, not cosmetic: without it, `& node ...` in PowerShell only ever
     # captures stdout into $rawLines -- stderr goes straight to the console/host and is
     # NEVER present in the captured variable, confirmed empirically (a `console.error(...);
@@ -109,7 +113,7 @@ function Invoke-OrnithToolClient {
     $reqPath = Join-Path $TempDir ('tool-req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; maxTurns = $MaxTurns }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-tool-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-tool-client.js'
     $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath }
     Remove-Item $reqPath -ErrorAction SilentlyContinue
     return ($rawLines -join "`n") | ConvertFrom-Json
@@ -241,6 +245,18 @@ if (-not (Test-Path $LiveLogPath)) {
 Write-Heartbeat -Status 'idle'
 
 while ($true) {
+    # Per-tick crash-resume (parity with local-worker.sh's top-of-tick pass -- see
+    # docs/linux-migration-2026-08-14.md item 8): a draft interrupted mid-call sits in
+    # THIS instance's own drafting/ subfolder, where the startup-only orphan scan above
+    # can't reach it (the owning process -- this one -- is alive). Without this, such a
+    # task stays claimed-but-untouched until the next process restart. Resumed INSTEAD of
+    # generating/claiming anything new, so backlog can't pile up in front of it.
+    $resumeFile = Get-ChildItem $MyDraftingDir -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object CreationTime | Select-Object -First 1
+    if ($resumeFile) {
+        Write-Host ('Resuming interrupted draft from own drafting/: {0}' -f $resumeFile.Name) -ForegroundColor DarkYellow
+        $next = $resumeFile
+        $draftingPath = $resumeFile.FullName
+    } else {
     node (Join-Path $PackageSrcDir 'task-sources.js') | Write-Host
 
     # DB mirror: make sure every pending file has a row (idempotent upsert per file).
@@ -334,6 +350,7 @@ while ($true) {
         Start-Sleep -Seconds 3
         continue
     }
+    } # end of the no-resume (generate + claim) path above
 
     # Per-task error isolation (2026-07-19, the real fix behind candidate AC-015's correct
     # diagnosis): before this try existed, ANY uncaught error in the pass sequence below --

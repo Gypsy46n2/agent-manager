@@ -34,7 +34,11 @@ if (-not (Test-InstanceLiveness -InstanceId 'review-runner' -TickSecs 600)) { ex
 # task moves to queue/approved/ instead of queue/done/, and a separate script
 # (apply-runner.ps1) does the actual git/file work for approved tasks.
 $ReviewProvider = if ($env:REVIEW_PROVIDER) { $env:REVIEW_PROVIDER } else { 'ornith' }
-$OrnithModel = if ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' }
+$OrnithModel = if ($env:LOCAL_MODEL) { $env:LOCAL_MODEL } elseif ($env:ORNITH_MODEL) { $env:ORNITH_MODEL } else { 'ornith:9b' }
+# local-client.js (the 2026-08-22 rename of ornith-client.js) reads LOCAL_MODEL, with the
+# old 'ornith' fallback deliberately removed -- so it must be set explicitly here or
+# every review call fails "model not found".
+$env:LOCAL_MODEL = $OrnithModel
 
 # Best-effort stagger against worker-*.json's own Ornith/GPU usage -- confirmed live
 # 2026-07-20: a review majority-vote call overlapping a worker's active Ornith call
@@ -66,7 +70,7 @@ function Invoke-OrnithClient {
     $reqPath = Join-Path $TempDir ('review-req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; think = $Think; temperature = $Temperature; numPredict = $NumPredict }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-client.js'
     try {
         # 2>&1 actually merges stderr into the captured array -- confirmed empirically
         # that without it, `& node ...` in PowerShell captures stdout only, so
@@ -76,7 +80,7 @@ function Invoke-OrnithClient {
         # and the concrete blocked-task example (arch-discovery-community-3) that exposed it.
         $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
         if ($LASTEXITCODE -ne 0) {
-            throw ('ornith-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+            throw ('local-client.js call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }
     } finally {
         Remove-Item $reqPath -ErrorAction SilentlyContinue
@@ -96,7 +100,7 @@ function Invoke-OrnithMajorityVote {
     $reqPath = Join-Path $TempDir ('review-vote-req-{0}.json' -f ([guid]::NewGuid()))
     $reqObj = [PSCustomObject]@{ prompt = $Prompt; mode = 'majority-vote'; classifyMarkers = $ClassifyMarkers; n = $N; minAgreeing = $MinAgreeing; temperature = $Temperature; minReasoningChars = $MinReasoningChars }
     [System.IO.File]::WriteAllText($reqPath, ($reqObj | ConvertTo-Json -Depth 10))
-    $clientPath = Join-Path $PackageSrcDir 'ornith-client.js'
+    $clientPath = Join-Path $PackageSrcDir 'local-client.js'
     try {
         # 2>&1 is the actual fix, not the exit-code check alone -- without it, `& node ...`
         # captures stdout only, so ornith-client.js's console.error(...)-then-exit(1)
@@ -105,7 +109,7 @@ function Invoke-OrnithMajorityVote {
         # concrete blocked-task example that exposed this same gap here too).
         $rawLines = Invoke-WithSafeEnv { & node $clientPath $reqPath 2>&1 }
         if ($LASTEXITCODE -ne 0) {
-            throw ('ornith-client.js majority-vote call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
+            throw ('local-client.js majority-vote call exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }
     } finally {
         Remove-Item $reqPath -ErrorAction SilentlyContinue
@@ -456,7 +460,22 @@ function Invoke-ReviewPass {
         # Ornith sometimes writes the literal two-character JSON-style empty-string
         # representation instead of a truly empty response). Keeping this one definition
         # of "empty" consistent across the pipeline instead of drifting per call site.
+        # Registry-driven, not a hardcoded list (parity with review-task.js's
+        # isEmptyApprovalSource()/isAdvisoryProseSource()): the sources registered after
+        # the original four-name list was written (pipeline_self_audit, backlog_fulfillment,
+        # arch_review, arch_import_review, the maintenance *_fix sources, and advisoryProse
+        # staleness_audit/*_review) were all being wrongly auto-rejected by the gates below.
+        # The old list survives only as the fallback when the node call itself fails.
         $emptyApprovalSources = @('arch_discovery', 'project_search', 'deep_dive', 'arch_import')
+        $advisoryProseSources = @()
+        try {
+            $reviewFlagsJson = Invoke-WithSafeEnv { node (Join-Path $PackageSrcDir 'task-sources.js') --review-flags 2>$null }
+            $reviewFlags = ($reviewFlagsJson -join "`n") | ConvertFrom-Json
+            if ($reviewFlags) {
+                $emptyApprovalSources = @($reviewFlags.PSObject.Properties | Where-Object { $_.Value.emptyApproval } | ForEach-Object { $_.Name })
+                $advisoryProseSources = @($reviewFlags.PSObject.Properties | Where-Object { $_.Value.advisoryProse } | ForEach-Object { $_.Name })
+            }
+        } catch { }
         $trimmedImplResponse = if ($task.implementResponse) { $task.implementResponse.Trim() } else { '' }
         $isEffectivelyEmpty = ($trimmedImplResponse -eq '') -or ($trimmedImplResponse -eq '""') -or ($trimmedImplResponse -eq "''")
         if (($task.source -in $emptyApprovalSources) -and $isEffectivelyEmpty) {
@@ -502,7 +521,10 @@ function Invoke-ReviewPass {
                 $isNonImplementation = $true
             }
         }
-        if ($isNonImplementation -and ($task.source -notin $emptyApprovalSources)) {
+        # advisoryProse sources (staleness_audit, the *_review maintenance sources) produce
+        # prose verdicts BY DESIGN -- exempt from the non-implementation gate, matching
+        # review-task.js's own isAdvisoryProseSource() carve-out.
+        if ($isNonImplementation -and ($task.source -notin $emptyApprovalSources) -and ($task.source -notin $advisoryProseSources)) {
             $reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no Ornith review call spent (mechanically detectable, not a judgment call).'
             Set-TaskBlockedStage -Task $task -Reason $reason -Stage 'review'
             $task | Add-Member -NotePropertyName 'reviewProvider' -NotePropertyValue 'deterministic-non-implementation' -Force

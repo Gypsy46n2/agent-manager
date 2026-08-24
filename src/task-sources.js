@@ -2059,6 +2059,22 @@ if (require.main === module) {
     return;
   }
 
+  // `node task-sources.js --review-flags` prints {name: {emptyApproval, advisoryProse}}
+  // for every registered source -- consumed by review-runner.ps1 so its deterministic
+  // gates (empty-response auto-approve, non-implementation auto-reject) follow the
+  // registry the same way review-task.js's isEmptyApprovalSource()/isAdvisoryProseSource()
+  // do, instead of a hardcoded source list that silently misjudges every source
+  // registered after it was written. Same "compute it once in JS, consume it from
+  // PowerShell" split as --priority-map above.
+  if (process.argv.includes('--review-flags')) {
+    const map = {};
+    for (const source of getRegisteredSources()) {
+      map[source.name] = { emptyApproval: !!source.emptyApproval, advisoryProse: !!source.advisoryProse };
+    }
+    console.log(JSON.stringify(map));
+    return;
+  }
+
   // `node task-sources.js --tier=low|high` -- restricts generation to that reasoning
   // tier (see getNextTask()'s own comment). Omitted entirely = no filter, generates
   // whichever source is highest priority regardless of tier, matching this CLI's

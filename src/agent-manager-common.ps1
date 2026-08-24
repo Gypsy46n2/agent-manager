@@ -156,8 +156,19 @@ $script:SafeEnvAllowlist = @(
     'AGENT_MANAGER_DEEP_DIVE_ANALYSIS_DIR', 'AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH',
     'AGENT_MANAGER_GRAPH_PATH', 'AGENT_MANAGER_DOMAINS_PATH', 'AGENT_MANAGER_DEFAULT_DOMAIN',
     'AGENT_MANAGER_MAIN_BRANCH', 'AGENT_MANAGER_MODEL_STATS_DB_PATH', 'AGENT_MANAGER_TROUBLE_LOG_PATH',
-    'SECOND_BRAIN_DIR', 'OLLAMA_URL', 'ORNITH_MODEL', 'ORNITH_KEEP_ALIVE', 'ORNITH_TIMEOUT_MS'
+    'SECOND_BRAIN_DIR', 'OLLAMA_URL', 'ORNITH_MODEL', 'ORNITH_KEEP_ALIVE', 'ORNITH_TIMEOUT_MS',
+    'LOCAL_MODEL', 'LOCAL_AB_MODELS', 'REVIEW_PROVIDER'
 )
+
+# Prefix families kept in addition to the exact names above. The 2026-08-22 Ornith->local
+# rename plus the post-migration sources (maintenance scans, claude-client.js, in-flight
+# lock attribution via AGENT_MANAGER_INSTANCE_ID) read ~30 vars across these namespaces,
+# and this pipeline owns every one of them -- enumerating each exact name here rotted once
+# already (LOCAL_MODEL was silently stripped for exactly the calls that needed it, so
+# every generation failed "model not found" while the var sat correctly in
+# agent-manager.env). Keeping whole owned namespaces can't rot that way; the allowlist's
+# original purpose (dropping UNRELATED ambient env from the host session) is untouched.
+$script:SafeEnvPrefixAllowlist = '^(AGENT_MANAGER_|CLAUDE_|LOCAL_|ORNITH_|OLLAMA_)'
 
 # Runs $ScriptBlock (expected to spawn a node child process) with this PowerShell session's
 # environment temporarily narrowed to $SafeEnvAllowlist, then restores every original
@@ -177,7 +188,7 @@ function Invoke-WithSafeEnv {
     $original = Get-ChildItem env: | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Value = $_.Value } }
     try {
         foreach ($item in $original) {
-            if ($script:SafeEnvAllowlist -notcontains $item.Name) {
+            if (($script:SafeEnvAllowlist -notcontains $item.Name) -and ($item.Name -notmatch $script:SafeEnvPrefixAllowlist)) {
                 Remove-Item -Path "env:$($item.Name)" -ErrorAction SilentlyContinue
             }
         }

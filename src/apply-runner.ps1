@@ -264,6 +264,13 @@ function Invoke-ApplyPass {
             throw ('apply-task.js exited {0}: {1}' -f $LASTEXITCODE, (($rawLines -join ' ').Trim()))
         }
         $result = ($rawLines -join "`n") | ConvertFrom-Json
+        # apply-task.js writes the task back to the path it was given (appendHistoryEvent
+        # + the apply-stage record -- see its own tail comment). Since we handed it a temp
+        # COPY, re-read that copy so those mutations survive into whatever queue file this
+        # script writes next (done/blocked) instead of being deleted with the temp file --
+        # without this, every apply-history event is silently discarded on Windows
+        # (scripts/apply-task.sh passes the real queue file, so Linux never had this gap).
+        try { $task = Read-TaskJson $tempTaskPath } catch { }
     } catch {
         $result = [PSCustomObject]@{ succeeded = $false; reason = $_.Exception.Message }
     } finally {

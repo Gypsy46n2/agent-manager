@@ -31,7 +31,41 @@ const os = require('os');
 const path = require('path');
 const { detectDegenerate } = require('./local-client.js');
 
-const CLAUDE_BIN = process.env.CLAUDE_CLI_BIN || 'claude';
+// On Windows an npm-installed `claude` is a .cmd/.ps1 shim, which execFileSync (no
+// shell) cannot execute -- ENOENT with a misleading "claude not found" even though
+// `claude` works fine in a terminal. Every arg here can contain arbitrary prompt text,
+// so routing through cmd.exe/shell:true (and its quoting rules) is not an option.
+// Instead resolve the shim to what it actually wraps: the native claude.exe the npm
+// package ships (current layout), or cli.js run under this same node (older layout).
+// POSIX, explicit paths, and unresolvable names all fall through unchanged.
+function resolveClaudeBin() {
+  const bin = process.env.CLAUDE_CLI_BIN || 'claude';
+  if (process.platform !== 'win32' || bin.includes('\\') || bin.includes('/') || path.extname(bin)) {
+    return { bin, prefixArgs: [] };
+  }
+  // Pure-fs PATH scan, deliberately NOT `where.exe` via execFileSync: this module's own
+  // tests mock child_process.execFileSync, and a module-load child spawn would both trip
+  // the "never spawned" assertions and consume the mock's canned responses.
+  for (const dir of (process.env.PATH || process.env.Path || '').split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      const exe = path.join(dir, `${bin}.exe`);
+      if (fs.existsSync(exe)) return { bin: exe, prefixArgs: [] };
+      if (fs.existsSync(path.join(dir, `${bin}.cmd`)) || fs.existsSync(path.join(dir, bin))) {
+        const pkgDir = path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code');
+        const nativeExe = path.join(pkgDir, 'bin', 'claude.exe');
+        if (fs.existsSync(nativeExe)) return { bin: nativeExe, prefixArgs: [] };
+        const cliJs = path.join(pkgDir, 'cli.js');
+        if (fs.existsSync(cliJs)) return { bin: process.execPath, prefixArgs: [cliJs] };
+      }
+    } catch {
+      // unreadable PATH entry -- keep scanning
+    }
+  }
+  return { bin, prefixArgs: [] };
+}
+const RESOLVED_CLAUDE = resolveClaudeBin();
+const CLAUDE_BIN = RESOLVED_CLAUDE.bin;
 const MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 // Claude Code turns can legitimately run minutes on hard tasks per its own docs, but
 // every call here is --max-turns 1 with no tools -- a single completion, not an agentic
@@ -132,7 +166,7 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
 
   let stdout;
   try {
-    stdout = execFileSync(CLAUDE_BIN, args, {
+    stdout = execFileSync(CLAUDE_BIN, [...RESOLVED_CLAUDE.prefixArgs, ...args], {
       encoding: 'utf8',
       // timeoutMs lets a caller running a genuinely long agentic session (real
       // Read/Grep/Glob/Edit/Write/Bash investigation + implementation + test runs, not

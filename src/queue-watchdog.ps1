@@ -381,12 +381,54 @@ function Invoke-RejectRetryCheck {
     }
 }
 
+# Post-migration per-tick housekeeping (parity with scripts/queue-watcher.sh's own tick:
+# drift detection, uptime sampling, scheduled Second Brain system reports, and the daily
+# community-graph rebuild -- none of which existed when this watchdog was written, so
+# on Windows drift was never detected, uptime reports had no data, scheduled reports
+# never fired, and arch_discovery's graph went permanently stale). Throttled to once per
+# minute: this loop ticks every 10s for dead-process detection, but queue-watcher.sh
+# runs these on its own 60s tick and none of them expects to run more often.
+$script:LastHousekeepingAt = [datetime]::MinValue
+function Invoke-PerTickHousekeeping {
+    if (((Get-Date) - $script:LastHousekeepingAt).TotalSeconds -lt 60) { return }
+    $script:LastHousekeepingAt = Get-Date
+    foreach ($call in @(
+        , @('drift-scan.js')
+        , @('uptime-log.js', '--sample')
+        , @('system-report.js', '--check-due')
+    )) {
+        $scriptFile = Join-Path $PackageSrcDir $call[0]
+        $extraArgs = @($call | Select-Object -Skip 1)
+        try {
+            Invoke-WithSafeEnv { & node $scriptFile @extraArgs 2>&1 } | Out-Null
+        } catch {
+            Write-Host ('Housekeeping {0} failed (non-fatal): {1}' -f $call[0], $_.Exception.Message) -ForegroundColor DarkYellow
+        }
+    }
+    # Daily community-graph rebuild -- build_graph.py --check-due decides internally
+    # whether a rebuild is actually due. Same interpreter resolution task-sources.js's
+    # onboardDeepDiveProject() uses: the repo's own venv first (where networkx actually
+    # lives), bare python off PATH otherwise.
+    try {
+        $packageRoot = Split-Path -Parent $PackageSrcDir
+        $buildGraph = Join-Path (Join-Path $packageRoot 'python') 'build_graph.py'
+        if (Test-Path $buildGraph) {
+            $venvPython = Join-Path $packageRoot '.venv\Scripts\python.exe'
+            $python = if (Test-Path $venvPython) { $venvPython } else { 'python' }
+            Invoke-WithSafeEnv { & $python $buildGraph --check-due 2>&1 } | Out-Null
+        }
+    } catch {
+        Write-Host ('Housekeeping build_graph.py failed (non-fatal): {0}' -f $_.Exception.Message) -ForegroundColor DarkYellow
+    }
+}
+
 while ($true) {
     Write-Heartbeat -Status 'checking'
     try {
         Invoke-DeadProcessCheck
         Invoke-StrayProcessReap
         Invoke-RejectRetryCheck
+        Invoke-PerTickHousekeeping
     } catch {
         Write-Host ('Watchdog pass failed (not crashing the loop): {0}' -f $_.Exception.Message) -ForegroundColor Red
     }
